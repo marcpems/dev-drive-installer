@@ -1,0 +1,181 @@
+name: Build Windows artifacts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.architecture }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    environment: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && 'release-signing' || 'validation' }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            platform: x64
+            runtime: win-x64
+          - architecture: Arm64
+            platform: ARM64
+            runtime: win-arm64
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v6.1.0
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run non-destructive backend tests
+        if: matrix.architecture == 'x64'
+        shell: powershell
+        run: .\tests\Test-StorageBackend.ps1
+
+      - name: Compile and validate native probe under Windows PowerShell
+        if: matrix.architecture == 'x64'
+        shell: powershell
+        run: .\tests\Test-VolumeProbe.ps1
+
+      - name: Compile and validate native probe with minimal Core references
+        if: matrix.architecture == 'x64'
+        shell: pwsh
+        run: .\tests\Test-VolumeProbe.ps1
+
+      - name: Publish and package self-contained application
+        shell: pwsh
+        env:
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          BUILD_RUNTIME: ${{ matrix.runtime }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $folder = Join-Path $PWD "artifacts\$env:BUILD_ARCHITECTURE"
+          dotnet publish .\DevDriveInstaller.csproj -c Release `
+            -r $env:BUILD_RUNTIME "-p:Platform=$env:BUILD_PLATFORM" -o $folder
+          if ($LASTEXITCODE -ne 0) { throw "Publish failed with exit $LASTEXITCODE." }
+
+          foreach ($name in @('DevDriveInstaller.exe', 'DevDriveInstaller.dll',
+            'System.Private.CoreLib.dll', 'coreclr.dll', 'hostfxr.dll', 'hostpolicy.dll',
+            'Microsoft.UI.Xaml.dll', 'App.xbf', 'MainWindow.xbf', 'DevDriveInstaller.pri')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $folder $name) -PathType Leaf)) {
+              throw "Required self-contained application file is missing: $name"
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $folder 'Assets\AppIcon.ico') -PathType Leaf)) {
+              throw 'Application icon is missing from publish output.'
+            }
+          }
+          $bin = Join-Path $PWD "bin\$env:BUILD_PLATFORM\Release\net8.0-windows10.0.22621.0\$env:BUILD_RUNTIME"
+          foreach ($name in @('App.xbf', 'MainWindow.xbf', 'DevDriveInstaller.pri')) {
+            if ((Get-FileHash -LiteralPath (Join-Path $folder $name)).Hash -cne
+                (Get-FileHash -LiteralPath (Join-Path $bin $name)).Hash) {
+              throw "Published XAML resource does not match build output: $name"
+            }
+          }
+          $machine = if ($env:BUILD_ARCHITECTURE -eq 'Arm64') { 0xAA64 } else { 0x8664 }
+          foreach ($name in @('DevDriveInstaller.exe', 'coreclr.dll', 'Microsoft.UI.Xaml.dll')) {
+            $reader = [IO.BinaryReader]::new([IO.File]::OpenRead((Join-Path $folder $name)))
+            try {
+              $reader.BaseStream.Position = 0x3c
+              $reader.BaseStream.Position = $reader.ReadInt32()
+              if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne $machine) {
+                throw "Incorrect native architecture: $name"
+              }
+            } finally { $reader.Dispose() }
+          }
+          $zip = Join-Path $PWD "artifacts\DevDriveInstaller-$env:BUILD_ARCHITECTURE.zip"
+          Compress-Archive -LiteralPath $folder -DestinationPath $zip -CompressionLevel Optimal
+          $hash = Get-FileHash -LiteralPath $zip -Algorithm SHA256
+          "$($hash.Hash)  $([IO.Path]::GetFileName($zip))" |
+            Set-Content -LiteralPath "$zip.sha256" -Encoding ascii
+
+      - name: Test signing isolation and private-key cleanup
+        if: matrix.architecture == 'x64'
+        shell: powershell
+        run: .\tests\Test-MSIX.ps1 -PublishDirectory .\artifacts\x64
+
+      - name: Build unsigned MSIX for validation
+        if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+        shell: powershell
+        env:
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+          BUILD_VERSION: 1.1.${{ github.run_number }}.0
+        run: |
+          .\installer\Build-MSIX.ps1 -Architecture $env:BUILD_ARCHITECTURE `
+            -Version $env:BUILD_VERSION
+
+      - name: Build MSIX with encrypted release-signing secrets
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: powershell
+        env:
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+          BUILD_VERSION: 1.1.${{ github.run_number }}.0
+          SIGNING_PFX_BASE64: ${{ secrets.MSIX_SIGNING_PFX_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.MSIX_SIGNING_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:SIGNING_PFX_BASE64 -or -not $env:SIGNING_PASSWORD) {
+            throw 'Release signing secrets are required; refusing an unsigned or temporary-certificate release.'
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP ("dev-drive-signing-" + [guid]::NewGuid().ToString('N') + '.pfx')
+          $password = ConvertTo-SecureString $env:SIGNING_PASSWORD -AsPlainText -Force
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+            .\installer\Build-MSIX.ps1 -Architecture $env:BUILD_ARCHITECTURE `
+              -Version $env:BUILD_VERSION -Sign -CertificatePath $pfx -CertificatePassword $password
+          } finally {
+            if (Test-Path -LiteralPath $pfx) { Remove-Item -LiteralPath $pfx -Force }
+            $password.Dispose()
+            Remove-Item Env:\SIGNING_PFX_BASE64, Env:\SIGNING_PASSWORD
+          }
+
+      - name: Upload application ZIP, MSIX installer and checksums
+        id: artifact-upload
+        continue-on-error: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: DevDriveInstaller-${{ matrix.architecture }}
+          path: |
+            artifacts\DevDriveInstaller-${{ matrix.architecture }}.zip
+            artifacts\DevDriveInstaller-${{ matrix.architecture }}.zip.sha256
+            artifacts\DevDriveInstaller-${{ matrix.architecture }}.msix
+            artifacts\DevDriveInstaller-${{ matrix.architecture }}.msix.sha256
+            artifacts\DevDriveInstaller-${{ matrix.architecture }}.cer
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release assets if Actions artifact storage is unavailable
+        if: steps.artifact-upload.outcome == 'failure' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ARCHITECTURE: ${{ matrix.architecture }}
+          BUILD_TAG: ci-${{ github.run_number }}-${{ github.run_attempt }}-${{ matrix.architecture }}
+          BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host '::warning::Actions artifact upload failed; publishing the verified build as repository release assets instead.'
+          $prefix = "artifacts\DevDriveInstaller-$env:BUILD_ARCHITECTURE"
+          $assets = @("$prefix.zip", "$prefix.zip.sha256", "$prefix.msix",
+            "$prefix.msix.sha256", "$prefix.cer")
+          $url = gh release create $env:BUILD_TAG @assets `
+            --repo $env:GITHUB_REPOSITORY --target $env:BUILD_COMMIT --prerelease `
+            --title "CI build $env:BUILD_TAG" `
+            --notes "Self-contained $env:BUILD_ARCHITECTURE ZIP and development-signed MSIX. Trust only the matching public certificate after reviewing this build. See README.txt for installation and experimental-storage limitations. Published here because Actions artifact upload was unavailable."
+          if ($LASTEXITCODE -ne 0) { throw "Release asset fallback failed: $LASTEXITCODE" }
+          "Download the $env:BUILD_ARCHITECTURE ZIP or MSIX: $url" |
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
